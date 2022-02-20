@@ -1,35 +1,27 @@
-#!./.venv/bin/python
-from gevent import monkey
-monkey.patch_all()
+#!/bin/sh
+"exec" "`dirname $0`/../.venv/bin/python" "$0" "$@"
 
+import os, sys
+ROOT = os.path.dirname(os.path.realpath(__file__))
+sys.path.append(os.path.join(ROOT, '..'))
 
-import os, sys, gc
+import json
 
-PRELOAD = bool(os.environ.get('PRELOAD', 'True'))
-if PRELOAD:
-    gc.disable() # disabling the gc asap so we dont have empty spaces triggering COW on forks later on
-
-sys.path.append("..")
-
-from pathlib import Path
-from typing import Dict
-
-
+from werkzeug.debug import DebuggedApplication
 from flask import Flask, request, Blueprint
-from flask_restx import Api, Resource
+from flask_restx import Api, Resource as FlaskResource
+from geventwebsocket import WebSocketServer, Resource
+
 from loguru import logger
-from lib.gunicorn_runner import FlaskApplication
 
-os.environ['prometheus_multiproc_dir'] = os.environ.get('prometheus_multiplroc_dir', '/tmp/')
-from prometheus_flask_exporter.multiprocess import GunicornInternalPrometheusMetrics
-
+from lib.aux_methods import find_free_port
+from lib.game_state import GameStateApplication
 
 
 ENV = os.environ.get('YGO_ENV', 'dev').lower()
-PORT = os.environ.get('YGO_PORT', 7777)
+PORT = 7777 if ENV == 'dev'else find_free_port()
 
 app = Flask(__name__, static_url_path='/static')
-GunicornInternalPrometheusMetrics(app)
 
 api_bp = Blueprint('api', __name__)
 
@@ -38,16 +30,11 @@ app.register_blueprint(api_bp, url_prefix='/api')
 
 app.config['PROPAGATE_EXCEPTIONS'] = True
 
+
 @app.route('/')
 @app.route('/favicon.ico')
 def favicon():
     return {}
-
-@api.route('/health')
-class GetHealth(Resource):
-    def get(self):
-        return 200
-
 
 @app.errorhandler(Exception)
 def internal_error(exception: Exception):
@@ -57,7 +44,29 @@ def internal_error(exception: Exception):
     return { 'error': msg }, getattr(exception, 'code', 500)
 
 
+@api.route("/websocket")
+class WebSocketDocs(FlaskResource):
+    '''Describes the websocket API documentation'''
+    def get(self):
+        return {}
+
+@api.route('/health')
+class GetHealth(FlaskResource):
+    def get(self):
+        return 200
+
+@api.route('/loadgame')
+class LoadGame(FlaskResource):
+    ''' Gamestate will be saved constantly (run info on UI and current game info on this serve)'''
+    ''' This endpoint loads and returns the pickled game info (board state) for the player to continue a game '''
+    def get(self):
+        return 200
+
 
 if __name__ == '__main__':
-    sys.argv = sys.argv[:1] # cleaning sysargs to not leak to gunicorn
-    FlaskApplication(app, port=PORT, preload=PRELOAD).run()
+    logger.info(f"Serving on port {PORT}")
+    WebSocketServer(('0.0.0.0', PORT),
+                    Resource([('^/game', GameStateApplication),
+                              ('^/.*', DebuggedApplication(app))
+                             ]),
+                    debug=False).serve_forever()
